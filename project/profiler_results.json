@@ -1,0 +1,150 @@
+{
+  "target_model": "meta-llama/Llama-3.2-3B",
+  "draft_model": "meta-llama/Llama-3.2-1B",
+  "max_new_tokens": 32,
+  "n_prompts": 2,
+  "baseline": [
+    {
+      "label": "general",
+      "gen_tokens": 32,
+      "wall_sec": 1.9201,
+      "total_cuda_ms": 1862.8,
+      "by_category_ms": {
+        "matmul": 1686.6,
+        "attention": 3.1,
+        "memory": 65.2,
+        "norm": 0.0,
+        "elementwise": 70.1,
+        "other": 37.8
+      }
+    },
+    {
+      "label": "code",
+      "gen_tokens": 32,
+      "wall_sec": 2.1483,
+      "total_cuda_ms": 1933.5,
+      "by_category_ms": {
+        "matmul": 1714.9,
+        "attention": 3.9,
+        "memory": 80.5,
+        "norm": 0.0,
+        "elementwise": 87.0,
+        "other": 47.2
+      }
+    }
+  ],
+  "linear_sd_k5": [
+    {
+      "label": "general",
+      "gen_tokens": 32,
+      "wall_sec": 1.9795,
+      "total_cuda_ms": 1620.5,
+      "by_category_ms": {
+        "matmul": 1335.4,
+        "attention": 16.0,
+        "memory": 90.0,
+        "norm": 0.0,
+        "elementwise": 114.5,
+        "other": 64.6
+      }
+    },
+    {
+      "label": "code",
+      "gen_tokens": 32,
+      "wall_sec": 1.6992,
+      "total_cuda_ms": 1459.1,
+      "by_category_ms": {
+        "matmul": 1218.4,
+        "attention": 13.4,
+        "memory": 76.3,
+        "norm": 0.0,
+        "elementwise": 97.0,
+        "other": 54.1
+      }
+    }
+  ],
+  "prompt_lookup_n5": [
+    {
+      "label": "general",
+      "gen_tokens": 32,
+      "wall_sec": 2.5803,
+      "total_cuda_ms": 2070.3,
+      "by_category_ms": {
+        "matmul": 1774.5,
+        "attention": 6.8,
+        "memory": 104.4,
+        "norm": 0.0,
+        "elementwise": 117.7,
+        "other": 66.9
+      }
+    },
+    {
+      "label": "code",
+      "gen_tokens": 32,
+      "wall_sec": 1.8876,
+      "total_cuda_ms": 1955.2,
+      "by_category_ms": {
+        "matmul": 1714.4,
+        "attention": 6.2,
+        "memory": 82.6,
+        "norm": 0.0,
+        "elementwise": 97.6,
+        "other": 54.3
+      }
+    }
+  ],
+  "cross_method_mean_ms": {
+    "baseline": {
+      "total": 1898.2,
+      "matmul": 1700.8,
+      "attention": 3.5,
+      "memory": 72.8,
+      "norm": 0.0,
+      "elementwise": 78.5,
+      "other": 42.5
+    },
+    "sd_k5": {
+      "total": 1539.8,
+      "matmul": 1276.9,
+      "attention": 14.7,
+      "memory": 83.2,
+      "norm": 0.0,
+      "elementwise": 105.8,
+      "other": 59.3
+    },
+    "pld_n5": {
+      "total": 2012.8,
+      "matmul": 1744.5,
+      "attention": 6.5,
+      "memory": 93.5,
+      "norm": 0.0,
+      "elementwise": 107.7,
+      "other": 60.6
+    }
+  },
+  "draft_target_split": [
+    {
+      "label": "general",
+      "draft_ms": 58.7,
+      "target_decode_ms": 188.2,
+      "target_verify_ms": 399.6
+    },
+    {
+      "label": "code",
+      "draft_ms": 56.5,
+      "target_decode_ms": 181.1,
+      "target_verify_ms": 365.7
+    }
+  ],
+  "csys": {
+    "csys_sd_ms_per_iter": 1.358,
+    "csys_pld_ms_per_iter": 2.259
+  },
+  "framework_amortization": {
+    "Cd_standalone_ms": 22.42,
+    "Cd_inpipeline_ms": 1.52,
+    "Cd_probe_ms": 20.03,
+    "apparent_ratio": 14.8,
+    "explanation": "measurement artifact from batched verify attribution, not real amortization"
+  }
+}

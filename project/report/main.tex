@@ -1,0 +1,533 @@
+\documentclass[letterpaper,twocolumn,10pt]{article}
+\usepackage{usenix}
+
+% --- Math and symbols ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% --- Graphics and plots ---
+\usepackage{graphicx}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{multirow}
+
+% --- Float control (eliminate large gaps in two-column layout) ---
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.1}
+\renewcommand{\floatpagefraction}{0.7}
+\renewcommand{\dbltopfraction}{0.9}          % for table* spanning both columns
+\setcounter{dbltopnumber}{3}                 % allow up to 3 double-col floats at top
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{5}
+
+% --- Tighten vertical spacing around display math ---
+\AtBeginDocument{%
+  \abovedisplayskip=8pt plus 2pt minus 4pt
+  \belowdisplayskip=8pt plus 2pt minus 4pt
+  \abovedisplayshortskip=4pt plus 2pt minus 2pt
+  \belowdisplayshortskip=4pt plus 2pt minus 2pt
+}
+
+% --- Title: usenix.sty already applies \Large\bf; do not duplicate ---
+\title{A Systems Study of Speculative Decoding for Large Language Model Inference}
+
+\author{
+{\rm Zanwen Fu}\\
+Duke University\\
+\texttt{zanwen.fu@duke.edu}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Autoregressive decoding remains a primary latency bottleneck in large language model (LLM) inference due to its inherent sequential dependency and limited token-level parallelism.
+Speculative decoding mitigates this constraint by using lightweight mechanisms to propose multiple candidate tokens that a larger target model verifies in fewer forward passes, preserving exact decoding semantics~\cite{leviathan2023speculative}.
+Although the foundational algorithm admits substantial theoretical acceleration, practical implementations can exhibit inconsistent gains due to KV-cache management, GPU memory behavior, and framework-level scheduling constraints~\cite{vllm_paper,vllm_docs,trtllm_docs}.
+
+This paper presents a systems-oriented comparative study of three speculative decoding families: linear draft-verify~\cite{leviathan2023speculative}, tree-structured speculation~\cite{miao2024specinfer,chen2024sequoia}, and retrieval-based model-free methods~\cite{he2024rest,saxena2023pld}.
+I develop a unified theoretical framework that extends the standard acceptance-based speedup model to each family, exposing fundamentally different overhead profiles: draft model inference cost, tree-structured KV-cache complexity, and CPU-side retrieval latency.
+I then conduct controlled experiments on a T4 GPU to measure end-to-end performance and attribute the gap between theoretical predictions and measured speedups to concrete system-level bottlenecks.
+Preliminary results from linear draft-verify and prompt lookup decoding are reported, with tree-structured experiments in progress.
+\end{abstract}
+
+\section{Introduction}
+
+Transformer-based LLMs generate text autoregressively, producing one token at a time conditioned on previous outputs.
+Even with KV caching and optimized attention implementations such as FlashAttention~\cite{flashattention}, decoding remains sequential at the token level, and the per-token loop is frequently dominated by memory movement rather than compute at small batch sizes.
+
+Speculative decoding reduces the number of expensive target-model forward passes by having a faster mechanism propose multiple candidate tokens that the target model verifies in parallel~\cite{leviathan2023speculative}.
+Under idealized assumptions, expected speedup increases with proposal length and acceptance rate.
+However, these assumptions omit system effects---draft inference cost, verification overhead, KV-cache rewind for rejected tokens, and scheduling latency---that can dominate end-to-end performance.
+
+\textbf{Observation.}
+Speculative decoding is not one technique but a \emph{family} of methods that make fundamentally different bets about where to spend system resources.
+Linear draft-verify methods~\cite{leviathan2023speculative} trade GPU compute for a small draft model.
+Tree-structured methods~\cite{miao2024specinfer,chen2024sequoia} expand the speculation space but increase KV-cache footprint and verification complexity.
+Retrieval-based methods~\cite{he2024rest,saxena2023pld} eliminate the draft model entirely, replacing GPU-side inference with CPU-side n-gram lookup.
+Each family exhibits a distinct overhead profile, yet most prior work evaluates methods in isolation, making cross-family comparison difficult.
+
+This study investigates speculative decoding as a systems-performance phenomenon through three central questions:
+(1)~How closely do empirical speedups match acceptance-based theoretical predictions across families?
+(2)~Which system-level bottleneck---draft compute, KV-cache management, or retrieval latency---dominates in each family?
+(3)~Under what deployment regimes (hardware, model size, decoding temperature, prompt domain) does each family offer a practical advantage?
+
+\section{Background and Taxonomy}
+
+I organize speculative decoding methods into three families based on their draft generation mechanism and corresponding system overhead profile.
+
+\subsection{Family 1: Linear Draft-Verify}
+
+Leviathan et al.~\cite{leviathan2023speculative} formalized speculative decoding as an exact acceleration technique.
+A draft model $M_d$ autoregressively proposes $k$ tokens, and the target model $M_t$ verifies them in a single forward pass.
+The algorithm commits the longest accepted prefix and repeats.
+Theoretical analysis relates expected speedup to proposal length~$k$, acceptance rate~$\alpha$, and relative model costs.
+
+The system overhead is concentrated in draft model inference: $M_d$ must run $k$ sequential forward passes, each requiring GPU compute and KV-cache updates.
+On rejection, the target model's KV-cache must be rewound to discard entries for rejected tokens---a bookkeeping operation whose cost depends on the cache implementation (contiguous vs.\ paged storage).
+
+HuggingFace Transformers implements this paradigm via assisted generation~\cite{hf_assisted}, supporting both fixed and adaptive speculation lengths.
+The \texttt{num\_assistant\_tokens} parameter controls~$k$, and the \texttt{num\_assistant\_tokens\_schedule} parameter enables heuristic adjustment based on acceptance history.
+
+\subsection{Family 2: Tree-Structured Speculation}
+
+Rather than proposing a single chain of $k$ tokens, tree-structured methods explore multiple candidate paths simultaneously.
+
+\textbf{SpecInfer}~\cite{miao2024specinfer} uses one or more small speculative models to generate candidate tokens organized as a token tree.
+The target model verifies all candidates in parallel using a tree-based attention mask, enabling a single forward pass to validate an entire tree of speculation.
+
+\textbf{Sequoia}~\cite{chen2024sequoia} improves upon SpecInfer in three ways.
+First, it introduces a dynamic programming algorithm to find the optimal tree topology for a given speculation budget, maximizing expected accepted tokens.
+Second, it uses a sampling-without-replacement verification procedure that is robust across decoding temperatures---unlike SpecInfer and top-$k$ sampling, which can repeatedly sample incorrect tokens at low temperatures.
+Third, it introduces a hardware-aware tree optimizer that selects tree size and depth based on the target hardware's compute-to-bandwidth ratio.
+
+Single-model variants such as Medusa~\cite{cai2024medusa} and Hydra~\cite{ankner2024hydra} augment the target model with extra prediction heads instead of a separate draft, eliminating cross-model overhead at the cost of model-specific training; I do not evaluate these in this study.
+
+The key system difference from linear methods is KV-cache complexity.
+Tree verification requires storing KV entries for \emph{all} nodes in the speculation tree, not just a linear chain.
+Verification cost grows with tree size, and rejected branches require selective cache pruning rather than simple truncation.
+Sequoia reports optimal tree sizes of ${\sim}64$ nodes for on-chip inference and 768+ for offloading~\cite{chen2024sequoia}.
+
+\subsection{Family 3: Retrieval-Based / Model-Free Methods}
+\label{sec:family3}
+
+Retrieval-based methods eliminate the draft model entirely, instead proposing candidate tokens by matching patterns in existing text.
+
+\textbf{Prompt Lookup Decoding (PLD)}~\cite{saxena2023pld} finds overlapping n-grams between the partially generated output and the input prompt, using matched continuations as candidate tokens.
+It requires no additional model, no training, and zero extra GPU memory.
+HuggingFace implements this as a single parameter: \texttt{prompt\_lookup\_num\_tokens}.
+
+\textbf{REST}~\cite{he2024rest} generalizes this to retrieval from an external datastore using suffix arrays.
+Given the current generation context, REST performs suffix matching against a large text corpus, constructs a trie of candidate continuations, prunes low-frequency branches, and feeds the remaining tree to the target model for verification via tree attention.
+
+\textbf{SAM-Decoding}~\cite{hu2024samdecoding} replaces the suffix array with a suffix automaton, achieving $O(1)$ amortized time for longest-suffix matching and integrating with model-based drafters like EAGLE for hybrid speculation.
+
+The overhead profile is fundamentally different: draft cost~$C_d$ is replaced by retrieval cost~$C_r$, which is CPU-bound (suffix matching, trie construction) rather than GPU-bound.
+This means retrieval methods add essentially zero GPU memory overhead but are highly domain-dependent: acceptance rates are high when the output overlaps with the datastore (e.g., summarization, RAG) but low for open-ended generation.
+
+\subsection{Unified Comparison}
+
+Table~\ref{tab:taxonomy} summarizes the three families along system-relevant dimensions.
+
+\begin{table*}[t]
+\centering
+\caption{Taxonomy of speculative decoding families by system overhead profile.}
+\label{tab:taxonomy}
+\smallskip
+\small
+\begin{tabular}{@{}l ccc@{}}
+\toprule
+\textbf{Dimension} & \textbf{Linear Draft-Verify} & \textbf{Tree-Structured} & \textbf{Retrieval-Based} \\
+\midrule
+Draft mechanism         & Small LM ($k$ sequential passes) & Small LM(s) or extra heads (tree) & N-gram / suffix matching \\
+Draft compute location  & GPU & GPU & CPU \\
+Extra GPU memory        & Draft model params + KV & Draft params + tree KV & None \\
+KV-cache on rejection   & Truncate linear prefix & Prune tree branches & Truncate (same as linear) \\
+Verification cost scaling      & $\approx$ constant (single chain) & Grows with tree size & Grows with trie width \\
+Temperature sensitivity & Degrades at high $T$ & Robust (Sequoia) & N/A (deterministic matching) \\
+Domain sensitivity      & Low (model-based) & Low (model-based) & High (depends on overlap) \\
+Training required       & No (reuse existing LM) & Medusa/Hydra: yes; SpecInfer: no & No \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+\section{Extended Theoretical Framework}
+\label{sec:theory}
+
+\subsection{Linear Draft-Verify (Review)}
+
+Following~\cite{leviathan2023speculative}, let $C_t$ denote the cost of one target forward pass, $C_d$ the cost per draft token, $k$ the proposal length, and $\alpha$ the empirical acceptance rate.
+Each speculative iteration drafts $k$ tokens and performs one verification pass:
+\[
+C_{\text{iter}} = kC_d + C_t.
+\]
+The expected committed tokens per iteration is approximately $\alpha k$, yielding speedup over greedy decoding:
+\begin{equation}
+\label{eq:linear_speedup}
+S_{\text{linear}} = \frac{\alpha k \cdot C_t}{kC_d + C_t}.
+\end{equation}
+This model predicts that speedup improves as $\alpha$ increases, $C_d/C_t$ decreases (smaller draft relative to target), and $k$ grows (more tokens proposed).
+However, it omits a system overhead term $C_{\text{sys}}$ (cache rewind, synchronization, scheduling) that reduces realized speedup:
+\begin{equation}
+\label{eq:linear_speedup_real}
+S_{\text{linear}}^{\text{real}} = \frac{\alpha k \cdot C_t}{kC_d + C_t + C_{\text{sys}}}.
+\end{equation}
+Quantifying $C_{\text{sys}}$ empirically is a primary goal of my experiments.
+
+\subsection{Tree-Structured Speculation}
+
+For tree-structured methods, the cost model changes in two ways.
+First, drafting produces a tree of $n$ nodes (not a chain), with total cost $C_d^{\text{tree}}(n)$.
+Second, verification cost grows with $n$ (tree attention over all nodes), unlike the approximately-constant cost in the linear case:
+\[
+C_{\text{iter}}^{\text{tree}} = C_d^{\text{tree}}(n) + C_t^{\text{tree}}(n).
+\]
+Sequoia's DP algorithm optimizes tree topology to maximize expected accepted tokens $\mathbb{E}[\tau(n)]$ for a given budget.
+Speedup becomes:
+\begin{equation}
+\label{eq:tree_speedup}
+S_{\text{tree}} = \frac{\mathbb{E}[\tau(n)] \cdot C_t}{C_d^{\text{tree}}(n) + C_t^{\text{tree}}(n) + C_{\text{sys}}^{\text{tree}}}.
+\end{equation}
+The system overhead $C_{\text{sys}}^{\text{tree}}$ is expected to exceed the linear case because rejected branches require selective KV-cache pruning rather than simple truncation.
+Critically, $C_t^{\text{tree}}(n)$ grows with $n$, creating diminishing returns beyond a hardware-dependent optimal tree size~\cite{chen2024sequoia}.
+
+\subsection{Retrieval-Based Methods}
+
+For retrieval-based methods, draft cost is replaced by CPU-side retrieval cost:
+$C_{\text{iter}}^{\text{ret}} = C_r + C_t^{\text{ret}}(m)$,
+where $C_r$ is suffix matching and trie construction cost, and $m$ is the number of candidate tokens.
+Since $C_r$ is CPU-bound, it adds zero GPU compute overhead---a fundamentally different resource tradeoff.
+Speedup is:
+\begin{equation}
+\label{eq:ret_speedup}
+S_{\text{ret}} = \frac{\mathbb{E}[\tau_r] \cdot C_t}{C_r + C_t^{\text{ret}}(m)}.
+\end{equation}
+The key variable is domain-dependent acceptance: $\mathbb{E}[\tau_r]$ is high for input-grounded tasks (summarization, RAG) but low for open-ended generation.
+For prompt lookup decoding, $C_r$ is negligible (in-prompt string matching), making it essentially free when it succeeds and harmless when it fails.
+
+\section{Experimental Design}
+
+\subsection{Hardware and Environment}
+
+All experiments run on a single NVIDIA T4 GPU (16\,GB VRAM, ${\sim}300$\,GB/s bandwidth) via Google Colab, with CUDA 12.8 and PyTorch 2.10.
+The T4's limited bandwidth makes system-level effects (memory stalls, KV-cache pressure) more pronounced than on high-end hardware.
+
+\subsection{Models}
+
+I use the Llama 3.2 family for tokenizer consistency: Llama-3.2-3B (fp16, ${\sim}6$\,GB) as the target and Llama-3.2-1B (fp16, ${\sim}2$\,GB) as the draft model for Family~1.
+To isolate the effect of quantization on the draft-to-target cost ratio, I additionally evaluate the 1B draft against Llama-3.1-8B in 4-bit quantization (parameter ratio 0.125 vs.\ 0.33).
+Family~3 (prompt lookup) requires no draft model.
+Family~2 (planned): Sequoia on T4 with model pair to be determined based on compatibility testing.
+
+\subsection{Prompt Suite and Controlled Variables}
+
+I use 10 prompts spanning five categories: general knowledge~(3), code generation~(2), summarization with high text repetition~(1), instruction following~(2), and long-context prefills~(2), enabling per-category acceptance rate analysis.
+Generation is capped at 128 new tokens.
+
+I fix precision (fp16), batch size (1, latency-focused), and framework (HuggingFace Transformers), and vary:
+(i)~speculation length $k \in \{3, 5, 7, 10\}$;
+(ii)~lookup window $n \in \{3, 5, 7, 10\}$;
+(iii)~temperature $T \in \{0.0, 0.6, 0.8\}$.
+For linear SD, I set \texttt{num\_assistant\_tokens\_schedule="constant"} to fix~$k$ and prevent heuristic confounds.
+
+\subsection{Measurements}
+
+For each configuration, I run 3 warmup iterations followed by 30 timed trials with proper CUDA synchronization (\texttt{torch.cuda.synchronize()}).
+I report: mean and median throughput (tokens/sec), p95 tail latency, end-to-end wall-clock time, peak GPU memory, and speedup relative to the autoregressive baseline at the same temperature.
+All timing uses \texttt{time.perf\_counter()} with explicit GPU synchronization to avoid measuring only kernel launch overhead.
+
+\section{Preliminary Results}
+
+All experiments use Llama-3.2-3B (fp16) as the target model on a T4 GPU (CUDA 12.8, PyTorch 2.10).
+I report results from two configurations: (1)~Llama-3.2-1B as draft against the 3B target (parameter ratio~0.33), and (2)~the same 1B draft against Llama-3.1-8B in 4-bit quantization (parameter ratio~0.125) to isolate the effect of quantization on the effective cost ratio.
+
+\subsection{Baseline Autoregressive Performance}
+
+Under greedy decoding, the target model achieves 26.42 tokens/sec with a mean per-request latency of 4.275\,s for 128 generated tokens (standard deviation 1.48\,tok/s across prompts).
+Peak GPU memory is 8{,}940\,MB.
+This establishes the denominator for all speedup calculations.
+
+\subsection{Linear Draft-Verify with 1B Draft (Family 1)}
+
+Table~\ref{tab:linear_results} reports throughput and speedup as a function of speculation length~$k$ using the Llama-3.2-1B draft model.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Linear speculative decoding with 1B draft (greedy, T4). The draft model is too large relative to the target, producing slowdowns at all~$k$.}
+\label{tab:linear_results}
+\smallskip
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+$k$ & Tok/s & Speedup & p95 Lat (s) & GPU (MB) \\
+\midrule
+Baseline & 26.42 & 1.000$\times$ & 5.302 & 8{,}940 \\
+3        & 26.68 & 1.010$\times$ & 5.975 & 9{,}006 \\
+5        & 25.83 & 0.977$\times$ & 6.057 & 9{,}006 \\
+7        & 25.54 & 0.967$\times$ & 6.111 & 9{,}006 \\
+10       & 24.34 & 0.921$\times$ & 6.391 & 9{,}006 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The results show a monotonic \emph{decrease} in throughput as $k$ increases, with $k=10$ producing an 8\% slowdown relative to the baseline.
+This is the failure regime predicted by Equation~\ref{eq:linear_speedup}: the 1B draft model is approximately one-third the size of the 3B target, so $C_d/C_t \approx 0.33$.
+At $k=10$, the draft stage alone costs ${\sim}3.3\,C_t$, meaning that even with perfect acceptance ($\alpha = 1$), the theoretical maximum speedup is only $10 / (3.3 + 1) \approx 2.3{\times}$---but with realistic $\alpha < 1$ and system overhead $C_{\text{sys}} > 0$, the draft overhead dominates.
+
+Standard deviation is notably higher for speculative decoding (4--5\,tok/s) than the baseline (1.48\,tok/s), reflecting prompt-dependent acceptance rate variance.
+Per-prompt analysis reveals that code prompts achieve $1.35{\times}$ speedup (high acceptance due to structured, predictable token sequences) while open-ended general prompts show $0.82$--$0.96{\times}$ slowdowns.
+
+\textbf{Implication:} This empirically confirms that the draft-to-target parameter ratio is a first-order system variable.
+When the draft model is insufficiently small, speculative decoding produces net slowdowns regardless of~$k$.
+
+\subsection{Effect of Quantization on Cost Ratio (Family 1)}
+
+To test whether increasing the target model size resolves the cost-ratio problem, I evaluate the same 1B draft against Llama-3.1-8B in 4-bit quantization (parameter ratio $1\text{B}/8\text{B} = 0.125$, vs.\ 0.33 for 1B/3B).
+Results are shown in Table~\ref{tab:quant_results}.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Linear SD with 1B draft against 8B target (4-bit, greedy, T4). Quantization closes the effective cost gap.}
+\label{tab:quant_results}
+\smallskip
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Config & Tok/s & Speedup & GPU (MB) \\
+\midrule
+8B-4bit baseline & 16.06 & 1.000$\times$ & 8{,}674 \\
+SD $k{=}3$       & 15.07 & 0.938$\times$ & 8{,}722 \\
+SD $k{=}5$       & 15.10 & 0.941$\times$ & 8{,}722 \\
+SD $k{=}7$       & 15.20 & 0.946$\times$ & 8{,}722 \\
+SD $k{=}10$      & 14.89 & 0.927$\times$ & 8{,}722 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Despite the improved parameter ratio, speculative decoding still produces 5--7\% slowdowns.
+4-bit quantization disproportionately accelerates the target by reducing its memory bandwidth requirement, while the fp16 draft receives no such benefit---the effective cost ratio is \emph{higher}, not lower.
+This reveals that \textbf{parameter ratio and cost ratio diverge under quantization}, with practical implications since quantized deployment is the norm on cost-constrained hardware.
+Per-prompt analysis shows the same pattern at larger magnitude: code prompts achieve $1.37$--$1.45{\times}$, while open-ended text drops to $0.52$--$0.65{\times}$.
+
+\subsection{Prompt Lookup Decoding (Family 3)}
+
+Table~\ref{tab:pld_results} reports prompt lookup decoding results.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Prompt lookup decoding results (greedy, T4). Consistent speedups with negligible GPU memory overhead.}
+\label{tab:pld_results}
+\smallskip
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+$n$ & Tok/s & Speedup & p95 Lat (s) & GPU (MB) \\
+\midrule
+3  & 33.69 & 1.275$\times$ & 4.877 & 8{,}945 \\
+5  & 34.77 & 1.316$\times$ & 4.917 & 8{,}948 \\
+7  & 35.66 & 1.350$\times$ & 4.919 & 8{,}950 \\
+10 & 36.68 & 1.388$\times$ & 4.857 & 8{,}955 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+In contrast to linear draft-verify, prompt lookup decoding achieves consistent speedups of $1.28$--$1.39{\times}$ with essentially zero GPU memory overhead (8{,}945--8{,}955\,MB vs.\ 8{,}940\,MB baseline).
+Speedup increases monotonically with lookup window~$n$ and shows no diminishing returns in this range, confirming that the retrieval cost~$C_r$ in Equation~\ref{eq:ret_speedup} is negligible relative to verification savings.
+
+Per-prompt analysis reveals strong domain dependence: one instruction prompt reaches $2.61{\times}$ while another shows $1.00{\times}$, confirming the domain-sensitivity property identified in Section~\ref{sec:family3}.
+
+\textbf{Cross-family comparison.}
+At $k = n = 5$, prompt lookup ($1.32{\times}$) outperforms linear draft-verify with either the 1B/3B ($0.98{\times}$) or 1B/8B-4bit ($0.94{\times}$) configuration.
+Prompt lookup's advantage stems from $C_r \approx 0$, though its effectiveness is bounded by prompt-output overlap.
+Figure~\ref{fig:speedup} summarizes the speedup landscape across families and configurations.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    width=\columnwidth,
+    height=4.5cm,
+    ylabel={Speedup vs.\ baseline},
+    ylabel style={font=\small},
+    symbolic x coords={SD k3, SD k5, SD k7, SD k10, PL n3, PL n5, PL n7, PL n10},
+    xtick=data,
+    x tick label style={rotate=35, anchor=east, font=\scriptsize},
+    ymin=0.7, ymax=1.55,
+    ytick={0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5},
+    y tick label style={font=\scriptsize},
+    bar width=7pt,
+    legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize, draw=none, fill=white, fill opacity=0.8},
+    every axis plot/.append style={fill opacity=0.85},
+    extra y ticks={1.0},
+    extra y tick style={grid=major, grid style={black, thick, dashed}},
+    extra y tick labels={},
+    nodes near coords,
+    every node near coord/.append style={font=\tiny, rotate=90, anchor=west},
+    point meta=explicit symbolic,
+]
+\addplot[fill=orange!70, draw=orange!90] coordinates {
+    (SD k3, 1.010) [{1.01}]
+    (SD k5, 0.977) [{0.98}]
+    (SD k7, 0.967) [{0.97}]
+    (SD k10, 0.921) [{0.92}]
+    (PL n3, 1.0) []
+    (PL n5, 1.0) []
+    (PL n7, 1.0) []
+    (PL n10, 1.0) []
+};
+\addplot[fill=green!60, draw=green!80] coordinates {
+    (SD k3, 1.0) []
+    (SD k5, 1.0) []
+    (SD k7, 1.0) []
+    (SD k10, 1.0) []
+    (PL n3, 1.275) [{1.28}]
+    (PL n5, 1.316) [{1.32}]
+    (PL n7, 1.350) [{1.35}]
+    (PL n10, 1.388) [{1.39}]
+};
+\legend{Linear SD (1B/3B), Prompt Lookup (3B)}
+\end{axis}
+\end{tikzpicture}
+\caption{Speedup vs.\ greedy baseline across families (T4). Dashed line marks break-even. Linear SD shows slowdowns; prompt lookup achieves $1.28$--$1.39{\times}$ with zero GPU overhead.}
+\label{fig:speedup}
+\end{figure}
+
+\subsection{Temperature Sensitivity}
+
+Speculative decoding performance degrades under sampling: with the 1B/3B configuration at $k{=}5$, speedup drops from $0.98{\times}$ (greedy) to $0.77{\times}$ ($T{=}0.6$) and $0.83{\times}$ ($T{=}0.8$).
+The 1B/8B-4bit configuration shows the same pattern more severely: $0.72{\times}$ at $T{=}0.6$.
+Sampling reduces draft-target agreement, lowering acceptance rates and compounding the cost-ratio problem.
+This motivates tree-structured methods such as Sequoia~\cite{chen2024sequoia}, which use sampling-without-replacement verification designed for temperature robustness.
+
+\subsection{Theory vs.\ Practice: Quantitative Gap Analysis}
+
+To close the loop between the theoretical framework (Section~\ref{sec:theory}) and measured results, I independently measure draft cost~$C_d$, target cost~$C_t$, and per-iteration acceptance rate~$\alpha$.
+
+\textbf{Cost and acceptance measurement.}
+I implement a manual speculative decoding loop to record per-iteration acceptance counts, and independently measure $C_d$ and $C_t$ via autoregressive generation timing.
+The 3B target yields $C_t = 37.63$\,ms/token; the 1B draft yields $C_d = 22.42$\,ms/token, giving a measured cost ratio $C_d/C_t = 0.596$.
+This is nearly double the parameter ratio~(0.333), revealing that on memory-bandwidth-bound hardware, per-token cost does not scale linearly with parameter count---kernel launch overhead and memory access patterns compress the gap.
+
+\textbf{Predicted vs.\ measured speedup.}
+Table~\ref{tab:gap} combines measured acceptance rates with Equation~\ref{eq:linear_speedup} predictions.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Theory vs.\ practice: measured~$\alpha$, predicted speedup from Eq.~\ref{eq:linear_speedup}, and actual speedup (1B/3B, greedy, T4). Positive gap indicates measured exceeds prediction.}
+\label{tab:gap}
+\smallskip
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+$k$ & $\alpha$ & $\alpha$ range & $S_{\text{pred}}$ & $S_{\text{meas}}$ & Gap \\
+\midrule
+3  & 0.732 & 0.61--0.93 & 0.788$\times$ & 1.010$\times$ & $+$0.222 \\
+5  & 0.644 & 0.49--1.00 & 0.810$\times$ & 0.977$\times$ & $+$0.167 \\
+7  & 0.550 & 0.41--0.76 & 0.745$\times$ & 0.967$\times$ & $+$0.222 \\
+10 & 0.488 & 0.34--0.85 & 0.701$\times$ & 0.921$\times$ & $+$0.220 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Notably, measured speedups consistently \emph{exceed} theoretical predictions (gap $\approx {+}0.2{\times}$), because $C_d$ and $C_t$ were measured via standalone generation rather than inside the assisted generation pipeline, which amortizes costs via shared KV-cache and batched verification.
+At $k{=}5$, speedup ${>}\,1.0$ requires $\alpha > 0.80$; only code prompts ($\alpha = 1.0$) cross this threshold.
+Together, these results show that $C_d/C_t = 0.596$ and domain-dependent~$\alpha$ jointly determine viability on bandwidth-constrained hardware.
+
+\section{Progress and Remaining Work}
+
+All taxonomy, theoretical framework, and experimental work described above is complete, covering Families~1 and~3 with quantitative gap analysis.
+The remaining work targets three objectives for the final report.
+
+\textbf{Tree-structured experiments (Family~2).}
+I will run Sequoia~\cite{chen2024sequoia} on T4 using its open-source implementation.
+The main challenge is generating T4-specific tree structures (``growmaps''), as the repository only provides pre-computed configurations for A100 and L40 GPUs.
+I plan to adapt the smallest existing growmap or run Sequoia's DP tree optimizer with T4 bandwidth parameters, enabling the first controlled three-family comparison on identical hardware and measurement methodology.
+I will evaluate Equation~\ref{eq:tree_speedup} empirically by measuring how verification cost scales with tree size on T4.
+
+\textbf{Profiling-based bottleneck attribution.}
+I will integrate PyTorch Profiler to decompose end-to-end latency into draft forward passes, target verification, and KV-cache operations, directly measuring $C_{\text{sys}}$ in Equation~\ref{eq:linear_speedup_real} rather than inferring it from the theory-practice gap.
+
+\textbf{Final deliverables.}
+The final report will include the full three-family comparison, profiling results, and a sensitivity analysis of how optimal family choice shifts with model size, temperature, and prompt domain.
+A demo notebook will accompany the presentation.
+
+{\small
+\begin{thebibliography}{13}
+
+\bibitem{leviathan2023speculative}
+Y.~Leviathan, M.~Kalman, and Y.~Matias.
+Fast inference from transformers via speculative decoding.
+In \emph{Proc.\ ICML}, 2023.
+
+\bibitem{cai2024medusa}
+T.~Cai et al.
+Medusa: Simple LLM inference acceleration framework with multiple decoding heads.
+In \emph{Proc.\ ICML}, 2024.
+
+\bibitem{ankner2024hydra}
+Z.~Ankner et al.
+Hydra: Sequentially-dependent draft heads for Medusa decoding.
+arXiv preprint arXiv:2402.05109, 2024.
+
+\bibitem{flashattention}
+T.~Dao et al.
+FlashAttention: Fast and memory-efficient exact attention with IO-awareness.
+In \emph{NeurIPS}, 2022.
+
+\bibitem{vllm_paper}
+W.~Kwon et al.
+Efficient memory management for large language model serving with PagedAttention.
+In \emph{Proc.\ SOSP}, 2023.
+
+\bibitem{vllm_docs}
+vLLM Documentation.
+Speculative decoding.
+\url{https://docs.vllm.ai}.
+
+\bibitem{trtllm_docs}
+NVIDIA TensorRT-LLM Documentation.
+Speculative decoding / speculative sampling.
+\url{https://nvidia.github.io/TensorRT-LLM}.
+
+\bibitem{miao2024specinfer}
+X.~Miao et al.
+SpecInfer: Accelerating generative LLM serving with tree-based speculative inference and verification.
+In \emph{Proc.\ ASPLOS}, 2024.
+
+\bibitem{chen2024sequoia}
+Z.~Chen et al.
+Sequoia: Scalable, robust, and hardware-aware speculative decoding.
+In \emph{NeurIPS}, 2024.
+
+\bibitem{he2024rest}
+Z.~He et al.
+REST: Retrieval-based speculative decoding.
+In \emph{Proc.\ NAACL}, 2024.
+
+\bibitem{saxena2023pld}
+A.~Saxena.
+Prompt lookup decoding.
+GitHub, 2023.
+\url{https://github.com/apoorvumang/prompt-lookup-decoding}.
+
+\bibitem{hu2024samdecoding}
+Y.~Hu et al.
+SAM Decoding: Speculative decoding via suffix automaton.
+arXiv preprint arXiv:2411.10666, 2024.
+
+\bibitem{hf_assisted}
+HuggingFace.
+Assisted generation: A new direction toward low-latency text generation, 2023.
+\url{https://huggingface.co/blog/assisted-generation}.
+
+\end{thebibliography}
+}
+
+\end{document}
