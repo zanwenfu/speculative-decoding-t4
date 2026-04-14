@@ -1,0 +1,47 @@
+/Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/site-packages/torchvision/io/image.py:14: UserWarning: Failed to load image Python extension: 'dlopen(/Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/site-packages/torchvision/image.so, 0x0006): Library not loaded: @rpath/libjpeg.9.dylib
+  Referenced from: <FB2FD416-6C4D-3621-B677-61F07C02A3C5> /Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/site-packages/torchvision/image.so
+  Reason: tried: '/Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/site-packages/torchvision/../../../libjpeg.9.dylib' (no such file), '/Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/site-packages/torchvision/../../../libjpeg.9.dylib' (no such file), '/Users/zanwenfu/miniforge3/envs/mls/lib/python3.9/lib-dynload/../../libjpeg.9.dylib' (no such file), '/Users/zanwenfu/miniforge3/envs/mls/bin/../lib/libjpeg.9.dylib' (no such file)'If you don't plan on using image functionality from `torchvision.io`, you can ignore this warning. Otherwise, there might be something wrong with your environment. Did you have `libjpeg` or `libpng` installed before building `torchvision` from source?
+  warn(
+
+Avg_loss: 1.8719644981622696
+Epoch 0: test accuracy = 0.3872, loss = 1.8719644981622696
+Avg_loss: 1.7432396922508875
+Epoch 1: test accuracy = 0.4187, loss = 1.7432396922508875
+Avg_loss: 1.6957662490010261
+Epoch 2: test accuracy = 0.4347, loss = 1.6957662490010261
+Avg_loss: 1.660699880818526
+Epoch 3: test accuracy = 0.4438, loss = 1.660699880818526
+Avg_loss: 1.6316580205162365
+Epoch 4: test accuracy = 0.4543, loss = 1.6316580205162365
+Avg_loss: 1.604185130596161
+Epoch 5: test accuracy = 0.462, loss = 1.604185130596161
+Avg_loss: 1.5796155806382497
+Epoch 6: test accuracy = 0.4778, loss = 1.5796155806382497
+Avg_loss: 1.5595526024699211
+Epoch 7: test accuracy = 0.4766, loss = 1.5595526024699211
+Avg_loss: 1.5403749955693882
+Epoch 8: test accuracy = 0.4861, loss = 1.5403749955693882
+Avg_loss: 1.5243728360533715
+Epoch 9: test accuracy = 0.493, loss = 1.5243728360533715
+Avg_loss: 1.5112036257485548
+Epoch 10: test accuracy = 0.4962, loss = 1.5112036257485548
+Avg_loss: 1.4976823122302692
+Epoch 11: test accuracy = 0.4991, loss = 1.4976823122302692
+Avg_loss: 1.48564176907142
+Epoch 12: test accuracy = 0.5028, loss = 1.48564176907142
+Avg_loss: 1.4759813734889031
+Epoch 13: test accuracy = 0.5035, loss = 1.4759813734889031
+Avg_loss: 1.4692625082532564
+Epoch 14: test accuracy = 0.5093, loss = 1.4692625082532564
+Avg_loss: 1.457528918683529
+Epoch 15: test accuracy = 0.516, loss = 1.457528918683529
+Avg_loss: 1.4491048172116279
+Epoch 16: test accuracy = 0.5218, loss = 1.4491048172116279
+Avg_loss: 1.441521839549144
+Epoch 17: test accuracy = 0.5218, loss = 1.441521839549144
+Avg_loss: 1.4347808119654655
+Epoch 18: test accuracy = 0.5262, loss = 1.4347808119654655
+Avg_loss: 1.4253686859707038
+Epoch 19: test accuracy = 0.5174, loss = 1.4253686859707038
+Final test accuracy: 0.5174
+

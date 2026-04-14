@@ -1,0 +1,16 @@
+Q1: In this programming assignment, why does Expert Parallelism (EP) not require an all-to-all communication step before expert computation?
+
+Answer:
+
+Expert Parallelism does not require a coordination all-to-all step before expert computation because both the input batch and the router are replicated on every process. Each rank independently computes the routing decisions for the entire batch and determines which tokens should be sent to which expert. Since all processes have identical routing logic and identical inputs, there is no need to exchange routing information or synchronize assignments. The only communication that occurs is the actual transfer of token data to the process that owns the corresponding expert. In short, communication is required for moving data, not for agreeing on routing decisions.
+
+
+Q2: What are the compute and communication costs of Expert Parallelism (EP)? What are the compute and communication costs of Tensor Parallelism (TP)? Do these theoretical costs align with your empirical observations from your implementation? Why or why not?
+
+Answer:
+
+In Expert Parallelism, each process owns a single expert. The compute cost per process is therefore proportional to the number of tokens routed to that expert. If routing is balanced, this is approximately batch size times topk divided by number of experts, multiplied by the cost of one expert network. The communication cost consists of two all-to-all exchanges: one to send tokens to their assigned experts and one to send expert outputs back to the originating ranks. The communication volume scales on the order of batch size times input dimension plus batch size times output dimension. If routing is imbalanced, some processes may receive more tokens than others, which increases both compute time and effective communication overhead due to stragglers.
+
+In Tensor Parallelism, each process holds a shard of every expert’s weight matrices. All experts are evaluated on every process, but each process computes only a fraction of each linear layer. The compute cost per process is proportional to the total number of experts multiplied by the shard size of each layer. Communication occurs within each sharded linear layer through collective operations such as allgather or allreduce. The communication volume scales with batch size times the sharded feature dimension for each layer, and therefore grows with both the number of experts and the number of layers, even if routing is sparse.
+
+These theoretical costs align with our empirical observations. In our experiments, TP was slightly faster than EP, with TP around 0.046 ms and EP around 0.121 ms for the same configuration. This is consistent with theory: EP performs two full all-to-all exchanges per forward pass, which can be relatively expensive even at small scale. TP instead performs smaller collective operations inside each layer, which were more efficient for the small model and batch sizes we tested. Because our tensors were small, the timing differences were modest, but the relative ordering matches the expected communication patterns.
