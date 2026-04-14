@@ -29,7 +29,7 @@
 \usepackage{pslatex}
 
 % appearance
-\usepackage[kerning,spacing]{microtype} % more compact and arguably nicer
+% \usepackage[kerning,spacing]{microtype} % requires pdftex>=1.40, disabled for xetex
 
 % Uncomment the following line if you want the columns of the last page 
 % equal in size. But note that doing so may cause issues with some 
@@ -38,7 +38,7 @@
 
 % refs and bib
 \usepackage{cite}               % order multiple entries in \cite{...}
-\usepackage{breakurl}           % break too-long urls in refs
+% \usepackage{breakurl}         % not needed for pdflatex+hyperref
 \usepackage{url}                % allow \url in bibtex for clickable links
 \usepackage{xcolor}             % color definitions, to be use for...
 \usepackage[]{hyperref}         % ...clickable refs within pdf...
